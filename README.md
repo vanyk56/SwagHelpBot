@@ -1,0 +1,32 @@
+# SwagHelpBot
+
+Discord-бот: автоматически выдаёт роль «игрок» всем новым участникам сервера. Бустеры (участники с активным бустом сервера) роль не получают.
+
+## Переменные окружения
+
+| Переменная | Описание |
+|---|---|
+| `TOKEN` | Токен бота из [Discord Developer Portal](https://discord.com/developers/applications) (вкладка Bot → Reset Token) |
+| `ROLE_ID` | ID роли, которая выдаётся новичкам |
+
+## Подготовка бота (один раз)
+
+1. В Discord Developer Portal → ваше приложение → вкладка **Bot** → включите **Server Members Intent** (Privileged Gateway Intents).
+2. Пригласите бота на сервер через OAuth2 → URL Generator (scope `bot`, права **Manage Roles**).
+3. В настройках сервера перетащите роль бота **выше** роли «игрок», иначе Discord не позволит её выдавать.
+
+## Деплой на Railway
+
+1. Откройте [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo** → выберите этот репозиторий.
+2. В сервисе откройте вкладку **Variables** и добавьте:
+   - `TOKEN` — токен бота
+   - `ROLE_ID` — `1558583780799680603`
+3. Нажмите **Deploy**. В логах должно появиться `Бот запущен как ...` и `Роль «игрок» найдена, всё готово`.
+
+## Локальный запуск
+
+```bash
+npm install
+cp .env.example .env   # впишите TOKEN
+npm start
+```
