@@ -1,4 +1,4 @@
-import { Client, Events, GatewayIntentBits } from 'discord.js';
+import { Client, Events, GatewayIntentBits, PermissionFlagsBits } from 'discord.js';
 import 'dotenv/config';
 
 const TOKEN = process.env.TOKEN?.trim();
@@ -23,24 +23,51 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
+async function canManageRole(guild) {
+  const role = await guild.roles.fetch(ROLE_ID).catch(() => null);
+  if (!role) {
+    console.error(`[${guild.name}] Роль ${ROLE_ID} на этом сервере не найдена.`);
+    return false;
+  }
+  const me = guild.members.me;
+  if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) {
+    console.error(
+      `[${guild.name}] У бота нет права «Управлять ролями». Пригласите бота заново: Discord Developer Portal → OAuth2 → URL Generator → галочка bot → галочка Manage Roles.`
+    );
+    return false;
+  }
+  if (role.position >= me.roles.highest.position) {
+    console.error(
+      `[${guild.name}] Роль бота («${me.roles.highest.name}») стоит НЕ выше роли «${role.name}». Настройки сервера → Роли → перетащите роль бота выше роли «${role.name}».`
+    );
+    return false;
+  }
+  return true;
+}
+
 client.once(Events.ClientReady, async (c) => {
   console.log(`Бот запущен как ${c.user.tag}`);
 
   for (const guild of c.guilds.cache.values()) {
-    const role = await guild.roles.fetch(ROLE_ID).catch(() => null);
-    if (!role) {
-      console.error(`[${guild.name}] Роль ${ROLE_ID} не найдена на сервере.`);
-    } else if (role.position >= guild.members.me.roles.highest.position) {
-      console.error(
-        `[${guild.name}] Роль «${role.name}» стоит выше или на уровне роли бота — опустите её в списке ролей, иначе выдать её нельзя.`
-      );
-    } else {
-      console.log(`[${guild.name}] Роль «${role.name}» найдена, всё готово.`);
+    if (!(await canManageRole(guild))) continue;
+
+    const members = await guild.members.fetch();
+    let fixed = 0;
+    for (const member of members.values()) {
+      if (member.user.bot || member.premiumSince || member.roles.cache.has(ROLE_ID)) continue;
+      try {
+        await member.roles.add(ROLE_ID, 'Автовыдача роли новичкам');
+        fixed++;
+      } catch (err) {
+        console.error(`[${guild.name}] Не удалось выдать роль ${member.user.tag}: ${err.message}`);
+      }
     }
+    console.log(`[${guild.name}] Проверка пройдена. Пропущенным выдана роль: ${fixed}. Жду новых участников.`);
   }
 });
 
 client.on(Events.GuildMemberAdd, async (member) => {
+  if (member.user.bot) return;
   if (member.premiumSince) {
     console.log(`${member.user.tag} — бустер, роль не выдаём.`);
     return;
