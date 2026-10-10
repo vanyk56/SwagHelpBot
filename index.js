@@ -41,10 +41,8 @@ if (!ROLE_ID) {
 }
 
 const TICKET_TOPICS = [
-  { value: 'complaint', label: 'Жалоба на игрока', description: 'Нарушение правил другим игроком', emoji: '🚨', slug: 'жалоба' },
   { value: 'question', label: 'Вопрос по серверу', description: 'Вайпы, магазины, игровой процесс', emoji: '❓', slug: 'вопрос' },
   { value: 'unban', label: 'Разбан / обжалование', description: 'Если вы получили блокировку', emoji: '🔓', slug: 'разбан' },
-  { value: 'idea', label: 'Предложение', description: 'Идеи по улучшению сервера', emoji: '💡', slug: 'идея' },
   { value: 'other', label: 'Другое', description: 'Любой другой вопрос', emoji: '✉️', slug: 'тикет' },
 ];
 
