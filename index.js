@@ -577,7 +577,8 @@ function buildSystemPrompt(topicLabel) {
     '',
     '## Ограничения',
     '- Ничего не выдумывай: нет данных в правилах — передавай администрации, а не сочиняй.',
-    '- Вложения (скриншоты, видео) ты не видишь: если суть вопроса ясна только из вложения — передавай администрации.',
+    '- Скриншоты игрока приходят тебе как изображения — внимательно рассматривай их и опирайся на увиденное при ответе.',
+    '- Видео ты не видишь: если суть вопроса или доказательства только в видео — попроси ключевые скриншоты или передай администрации.',
     '- Игроку отвечай на русском; summary_en для администрации — на английском.',
     '',
     '## Формат ответа',
@@ -587,15 +588,59 @@ function buildSystemPrompt(topicLabel) {
   ].join('\n');
 }
 
+const VISION_MAX_IMAGES = 4;
+const VISION_MAX_BYTES = 8 * 1024 * 1024;
+const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif)$/i;
+
+function ownerImageParts(msg, budget) {
+  const urls = [];
+  let hasVideo = false;
+  let hasSkippedImage = false;
+  for (const a of msg.attachments?.values() || []) {
+    if (IMAGE_EXT_RE.test(a.name || '')) {
+      if ((a.size || 0) <= VISION_MAX_BYTES && urls.length < budget) urls.push(a.url);
+      else hasSkippedImage = true;
+    } else if (!/\.txt$/i.test(a.name || '')) {
+      hasVideo = true;
+    }
+  }
+  return { urls, hasVideo, hasSkippedImage };
+}
+
 async function buildHistory(channel, ownerId) {
   const fetched = await channel.messages.fetch({ limit: 100 });
   const sorted = [...fetched.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-  return sorted.map((m) => {
-    const text = m.content?.trim() || (m.attachments?.size ? '[вложение: скриншот или видео]' : '');
-    if (m.author.bot) return { role: 'assistant', content: text || '[интерактивная панель]' };
-    if (m.author.id === ownerId) return { role: 'user', content: text || '[пустое сообщение]' };
-    return { role: 'user', content: `[СТАФФ] ${m.author.username}: ${text}` };
-  });
+  let budget = VISION_MAX_IMAGES;
+  const result = new Array(sorted.length);
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const m = sorted[i];
+    let content;
+
+    if (m.author.bot) {
+      content = m.content?.trim() || '[интерактивная панель]';
+    } else if (m.author.id === ownerId) {
+      const { urls, hasVideo, hasSkippedImage } = ownerImageParts(m, budget);
+      budget -= urls.length;
+      let text = m.content?.trim();
+      if (!text) {
+        text = urls.length
+          ? '[скриншот]'
+          : hasVideo
+            ? '[вложение: видео]'
+            : hasSkippedImage
+              ? '[вложение: изображение]'
+              : '[пустое сообщение]';
+      }
+      content = urls.length
+        ? [{ type: 'text', text }, ...urls.map((u) => ({ type: 'image_url', image_url: { url: u } }))]
+        : text;
+    } else {
+      content = `[СТАФФ] ${m.author.username}: ${m.content?.trim() || '[вложение]'}`;
+    }
+
+    result[i] = { role: m.author.bot ? 'assistant' : 'user', content };
+  }
+  return result;
 }
 
 function parseVerdict(raw, allowedActions = ['reply', 'close', 'escalate']) {
@@ -1084,9 +1129,9 @@ function buildComplaintSystemPrompt(meta) {
     `Ты — ИИ-модератор жалоб Discord-сервера Rust «${SERVER_NAME}». Ты работаешь в приватном канале, где игрок подал жалобу на другого игрока. Цель жалобы: ${meta.display}.`,
     '',
     '## Задача',
-    '1. Проверь полноту жалобы: описание нарушения, доказательства (видео/скриншоты — в переписке они видны как [вложение]), Steam ID нарушителя (SteamID64).',
+    '1. Проверь полноту жалобы: описание нарушения, Steam ID нарушителя (SteamID64) и доказательства. Скриншоты приходят тебе как изображения — рассматривай их и проверяй, действительно ли на них видно нарушение. Видео ты не видишь: это тоже доказательство, но оценивай его по описанию автора.',
     '2. Чего-то не хватает → задай один конкретный вопрос (reply). Если автор просто спрашивает о процессе подачи — ответь по делу.',
-    '3. Жалоба полная (есть описание + доказательства) → сформулируй её и передай администрации (submit).',
+    '3. Жалоба полная (описание + доказательства, скриншот подтверждает или не противоречит) → сформулируй её и передай администрации (submit). Если скриншот явно НЕ подтверждает жалобу или выглядит подделкой — всё равно передай администрации с пометкой в summary_en (submit), решение за людьми.',
     '4. Это не жалоба, мусор, троллинг, попытка что-то разузнать или пустой вопрос → вежливо отклонить и закрыть (close).',
     '',
     '## Строго запрещено',
