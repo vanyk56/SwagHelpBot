@@ -84,6 +84,10 @@ const COMMANDS = [
     .setDescription('Опубликовать панель тикетов в этом канале и закрепить её')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName('ai-off')
+    .setDescription('Отключить ИИ в этом тикете — отвечает и закрывает только администрация')
+    .toJSON(),
 ];
 
 const acknowledgedTickets = new Set();
@@ -354,6 +358,10 @@ async function runAITriage(channel, meta) {
     const topicLabel = parts[2]?.trim() || parts[1]?.trim() || 'Обращение';
     const history = await buildHistory(channel, meta.userId);
     const verdict = await callOpenRouter(topicLabel, history);
+    if (humanTakeover.has(channel.id)) {
+      console.log(`[AI] ${channel.name}: вердикт отброшен — ИИ отключён командой администрации.`);
+      return;
+    }
     console.log(`[AI] ${channel.name}: ${verdict.action} — ${verdict.reason}`);
     await applyVerdict(channel, meta, verdict);
   } catch (err) {
@@ -631,10 +639,7 @@ async function handleTicketClose(i) {
     return;
   }
   const isOwner = i.user.id === meta.userId;
-  const isStaff =
-    i.member.permissions.has(PermissionFlagsBits.ManageGuild) ||
-    (SUPPORT_ROLE_ID && i.member.roles.cache.has(SUPPORT_ROLE_ID));
-  if (!isOwner && !isStaff) {
+  if (!isOwner && !isStaffMember(i.member)) {
     await i.reply({ content: 'Закрыть тикет может только его автор или администрация.', flags: MessageFlags.Ephemeral });
     return;
   }
@@ -658,10 +663,47 @@ async function handleTicketCloseConfirm(i) {
   scheduleChannelClose(i.channel, 10_000);
 }
 
+function isStaffMember(member) {
+  return (
+    member.permissions.has(PermissionFlagsBits.ManageGuild) ||
+    Boolean(SUPPORT_ROLE_ID && member.roles.cache.has(SUPPORT_ROLE_ID)) ||
+    Boolean(STAFF_ROLE_ID && member.roles.cache.has(STAFF_ROLE_ID))
+  );
+}
+
+async function handleAIOff(i) {
+  const meta = parseTicketTopic(i.channel?.topic);
+  if (!meta) {
+    await i.reply({ content: 'Эта команда работает только внутри тикета.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!isStaffMember(i.member)) {
+    await i.reply({ content: 'Команда доступна только администрации.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  humanTakeover.add(i.channelId);
+  if (aiTimers.has(i.channelId)) {
+    clearTimeout(aiTimers.get(i.channelId));
+    aiTimers.delete(i.channelId);
+  }
+  if (closeTimers.has(i.channelId)) {
+    clearTimeout(closeTimers.get(i.channelId));
+    closeTimers.delete(i.channelId);
+  }
+  await i.reply({
+    content: AI_ENABLED
+      ? '🤖 ИИ отключён в этом тикете: бот больше не отвечает и не закрывает его автоматически. Дальше тикет ведёт администрация.'
+      : 'ИИ-триаж и так выключен на всём сервере — тикет ведёт администрация.',
+  });
+}
+
 client.on(Events.InteractionCreate, async (i) => {
   try {
     if (i.isChatInputCommand() && i.commandName === 'setup-tickets') {
       await handleSetupTickets(i);
+    } else if (i.isChatInputCommand() && i.commandName === 'ai-off') {
+      await handleAIOff(i);
     } else if (i.isStringSelectMenu() && i.customId === 'ticket_create') {
       await handleTicketCreate(i);
     } else if (i.isButton() && i.customId === 'ticket_close') {
