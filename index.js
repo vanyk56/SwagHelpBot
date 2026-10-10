@@ -67,6 +67,7 @@ const SERVER_NAME = process.env.SERVER_NAME?.trim() || 'SWAG RUST';
 const SERVER_CONNECT = process.env.SERVER_CONNECT?.trim() || '157.85.87.131:28061';
 const SERVER_SITE = process.env.SERVER_SITE?.trim() || 'https://swagrust.ru/';
 const AI_RULES = (process.env.AI_RULES?.trim() || DEFAULT_RULES).replace(/\\n/g, '\n');
+const AI_IDLE_CLOSE_MINUTES = parseInt(process.env.AI_IDLE_CLOSE_MINUTES || '5', 10);
 const AI_ENABLED = Boolean(OPENROUTER_API_KEY);
 
 if (!TOKEN) {
@@ -122,6 +123,7 @@ const closeTimers = new Map();
 const aiTimers = new Map();
 const aiBusy = new Set();
 const humanTakeover = new Set();
+const idleCloseTimers = new Map();
 
 function parseTicketTopic(topic) {
   if (!topic || !topic.startsWith('ticket:')) return null;
@@ -411,8 +413,44 @@ async function runAITriage(channel, meta) {
   }
 }
 
+function scheduleIdleClose(channel) {
+  if (idleCloseTimers.has(channel.id)) clearTimeout(idleCloseTimers.get(channel.id));
+  idleCloseTimers.set(
+    channel.id,
+    setTimeout(async () => {
+      idleCloseTimers.delete(channel.id);
+      if (humanTakeover.has(channel.id) || closeTimers.has(channel.id)) return;
+      try {
+        await channel.send({
+          components: [
+            new ContainerBuilder()
+              .setAccentColor(BRAND_COLOR)
+              .addTextDisplayComponents(
+                new TextDisplayBuilder().setContent(
+                  [
+                    '# 💤 Тикет закрыт: нет ответа',
+                    `> Игрок не отвечал более ${AI_IDLE_CLOSE_MINUTES} минут после ответа поддержки.`,
+                    '-# Вопрос решён? Отлично! Если нет — создайте новый тикет в канале поддержки.',
+                  ].join('\n')
+                )
+              ),
+          ],
+          flags: MessageFlags.IsComponentsV2,
+        });
+        scheduleChannelClose(channel, 15_000);
+      } catch (err) {
+        console.error(`[AI] Не удалось закрыть тикет после неактивности (${channel.name}): ${err.message}`);
+      }
+    }, AI_IDLE_CLOSE_MINUTES * 60_000)
+  );
+}
+
 async function applyVerdict(channel, meta, verdict) {
   if (verdict.action === 'close') {
+    if (idleCloseTimers.has(channel.id)) {
+      clearTimeout(idleCloseTimers.get(channel.id));
+      idleCloseTimers.delete(channel.id);
+    }
     await channel.send(
       `${verdict.reply || 'Вопрос решён — тикет закрыт.'}\n\n-# Если вопрос не решён — напишите сообщение в ближайшие 20 секунд, и автозакрытие отменится.`
     );
@@ -420,6 +458,7 @@ async function applyVerdict(channel, meta, verdict) {
     scheduleChannelClose(channel, 20_000);
   } else if (verdict.action === 'reply') {
     await channel.send(verdict.reply);
+    scheduleIdleClose(channel);
   } else {
     humanTakeover.add(channel.id);
     await escalateTicket(channel, meta, verdict);
@@ -427,6 +466,10 @@ async function applyVerdict(channel, meta, verdict) {
 }
 
 async function escalateTicket(channel, meta, verdict) {
+  if (idleCloseTimers.has(channel.id)) {
+    clearTimeout(idleCloseTimers.get(channel.id));
+    idleCloseTimers.delete(channel.id);
+  }
   const roleId = STAFF_ROLE_ID;
   if (roleId) {
     const role = await channel.guild.roles.fetch(roleId).catch(() => null);
@@ -695,8 +738,13 @@ async function handleTicketClose(i) {
 async function handleTicketCloseConfirm(i) {
   await i.update({ content: 'Закрываю тикет…', components: [] });
   await i.channel.send({ components: [ticketClosedPanel(10)], flags: MessageFlags.IsComponentsV2 });
-  acknowledgedTickets.delete(i.channelId);
-  humanTakeover.delete(i.channelId);
+  for (const map of [acknowledgedTickets, humanTakeover]) map.delete(i.channelId);
+  for (const map of [closeTimers, aiTimers, idleCloseTimers]) {
+    if (map.has(i.channelId)) {
+      clearTimeout(map.get(i.channelId));
+      map.delete(i.channelId);
+    }
+  }
   scheduleChannelClose(i.channel, 10_000);
 }
 
@@ -724,9 +772,11 @@ async function handleAIOff(i) {
     clearTimeout(aiTimers.get(i.channelId));
     aiTimers.delete(i.channelId);
   }
-  if (closeTimers.has(i.channelId)) {
-    clearTimeout(closeTimers.get(i.channelId));
-    closeTimers.delete(i.channelId);
+  for (const map of [closeTimers, idleCloseTimers]) {
+    if (map.has(i.channelId)) {
+      clearTimeout(map.get(i.channelId));
+      map.delete(i.channelId);
+    }
   }
   await i.reply({
     content: AI_ENABLED
@@ -771,6 +821,10 @@ client.on(Events.MessageCreate, async (msg) => {
     closeTimers.delete(msg.channelId);
     await msg.reply({ content: '⏳ Автозакрытие отменено — тикет снова открыт.' }).catch(() => {});
   }
+  if (idleCloseTimers.has(msg.channelId)) {
+    clearTimeout(idleCloseTimers.get(msg.channelId));
+    idleCloseTimers.delete(msg.channelId);
+  }
 
   if (!AI_ENABLED) {
     if (acknowledgedTickets.has(msg.channelId)) return;
@@ -784,7 +838,7 @@ client.on(Events.MessageCreate, async (msg) => {
 });
 
 client.on(Events.ChannelDelete, (channel) => {
-  for (const map of [closeTimers, aiTimers]) {
+  for (const map of [closeTimers, aiTimers, idleCloseTimers]) {
     if (map.has(channel.id)) {
       clearTimeout(map.get(channel.id));
       map.delete(channel.id);
