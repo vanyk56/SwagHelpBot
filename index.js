@@ -15,7 +15,12 @@ import {
   SeparatorBuilder,
   SeparatorSpacingSize,
   ChannelType,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } from 'discord.js';
+import fs from 'node:fs';
+import path from 'node:path';
 import 'dotenv/config';
 
 const DEFAULT_RULES = `Незнание правил не освобождает от ответственности: подключаясь к серверу, находясь в Discord-сообществе или покупая товары в магазине, игрок автоматически соглашается со всеми пунктами правил.
@@ -68,6 +73,7 @@ const SERVER_CONNECT = process.env.SERVER_CONNECT?.trim() || '157.85.87.131:2806
 const SERVER_SITE = process.env.SERVER_SITE?.trim() || 'https://swagrust.ru/';
 const AI_RULES = (process.env.AI_RULES?.trim() || DEFAULT_RULES).replace(/\\n/g, '\n');
 const AI_IDLE_CLOSE_MINUTES = parseInt(process.env.AI_IDLE_CLOSE_MINUTES || '5', 10);
+const COMPLAINTS_LOG_CHANNEL_ID = process.env.COMPLAINTS_LOG_CHANNEL_ID?.trim() || null;
 const AI_ENABLED = Boolean(OPENROUTER_API_KEY);
 
 if (!TOKEN) {
@@ -116,6 +122,16 @@ const COMMANDS = [
     .setName('ai-off')
     .setDescription('Отключить ИИ в этом тикете — отвечает и закрывает только администрация')
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName('setup-complaints')
+    .setDescription('Опубликовать панель жалоб на игроков в этом канале и закрепить её')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName('setup-complaints-log')
+    .setDescription('Назначить этот канал каналом приёма жалоб для администрации')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .toJSON(),
 ];
 
 const acknowledgedTickets = new Set();
@@ -125,12 +141,50 @@ const aiBusy = new Set();
 const humanTakeover = new Set();
 const idleCloseTimers = new Map();
 
+const STATE_FILE = path.join(process.cwd(), 'data', 'state.json');
+const complaintLogChannels = new Map();
+try {
+  if (fs.existsSync(STATE_FILE)) {
+    const saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    for (const [guildId, channelId] of Object.entries(saved.complaintLogChannels || {})) {
+      complaintLogChannels.set(guildId, channelId);
+    }
+  }
+} catch (err) {
+  console.error('Не удалось загрузить data/state.json:', err.message);
+}
+
+function saveState() {
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ complaintLogChannels: Object.fromEntries(complaintLogChannels) }, null, 2));
+  } catch (err) {
+    console.error('Не удалось сохранить data/state.json:', err.message);
+  }
+}
+
 function parseTicketTopic(topic) {
   if (!topic || !topic.startsWith('ticket:')) return null;
   const parts = topic.split('|');
   const userId = parts[0].replace('ticket:', '').trim();
   if (!userId) return null;
   return { userId, value: parts[1]?.trim() || null };
+}
+
+function parseComplaintTopic(topic) {
+  if (!topic || !topic.startsWith('complaint:')) return null;
+  const parts = topic.split('|');
+  const userId = parts[0].replace('complaint:', '').trim();
+  if (!userId) return null;
+  return { userId, key: parts[1]?.trim() || '', display: parts[2]?.trim() || 'неизвестный игрок' };
+}
+
+function parseChannelTopic(topic) {
+  const ticket = parseTicketTopic(topic);
+  if (ticket) return { kind: 'ticket', ...ticket };
+  const complaint = parseComplaintTopic(topic);
+  if (complaint) return { kind: 'complaint', ...complaint };
+  return null;
 }
 
 function ticketsPanel() {
@@ -162,6 +216,69 @@ function ticketsPanel() {
                 .setEmoji(t.emoji)
             )
           )
+      )
+    );
+}
+
+function complaintsPanel() {
+  return new ContainerBuilder()
+    .setAccentColor(BRAND_COLOR)
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(
+        [
+          '# 🚨 Жалобы на игроков',
+          '### Заметили читера или нарушителя?',
+          '> Опишите нарушение и приложите доказательства — жалоба уйдёт администрации приватно.',
+          '▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬',
+          '- 📹 Приложите **видео или скриншоты** нарушения',
+          '- 🆔 Укажите **ник и Steam ID** игрока',
+          '- 🔒 Всё **строго конфиденциально** — игрок не узнает, кто пожаловался',
+          '',
+          '-# Ложные жалобы и обращения «просто узнать информацию» не рассматриваются.',
+        ].join('\n')
+      )
+    )
+    .addSeparatorComponents(new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small))
+    .addActionRowComponents(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId('complaint_open')
+          .setLabel('Подать жалобу')
+          .setEmoji('🚨')
+          .setStyle(ButtonStyle.Danger)
+      )
+    );
+}
+
+function complaintWelcomePanel(member, display) {
+  return new ContainerBuilder()
+    .setAccentColor(BRAND_COLOR)
+    .addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(
+        [
+          '# 🚨 Жалоба на игрока',
+          `> Подал: ${member}`,
+          `> Игрок: ${display}`,
+          '▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬',
+          '### Что нужно для рассмотрения',
+          '- 📹 **Видео или скриншоты** нарушения — жалоба без доказательств не рассматривается',
+          '- 🆔 **Steam ID** игрока — если не указали при создании',
+          '- 📝 **Время и место** — когда и где произошло нарушение',
+          '',
+          '> Информация по жалобам строго конфиденциальна и не разглашается.',
+          '',
+          '-# Отправьте доказательства сообщениями сюда — ИИ проверит и передаст жалобу администрации.',
+        ].join('\n')
+      )
+    )
+    .addSeparatorComponents(new SeparatorBuilder().setSpacing(SeparatorSpacingSize.Small))
+    .addActionRowComponents(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId('ticket_close')
+          .setLabel('Отозвать жалобу')
+          .setEmoji('🗑')
+          .setStyle(ButtonStyle.Danger)
       )
     );
 }
@@ -314,7 +431,7 @@ async function buildHistory(channel, ownerId) {
   });
 }
 
-function parseVerdict(raw) {
+function parseVerdict(raw, allowedActions = ['reply', 'close', 'escalate']) {
   let text = raw.trim();
   const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence) text = fence[1].trim();
@@ -322,7 +439,7 @@ function parseVerdict(raw) {
   const end = text.lastIndexOf('}');
   if (start === -1 || end === -1 || end <= start) throw new Error('ИИ вернул ответ не в формате JSON');
   const parsed = JSON.parse(text.slice(start, end + 1));
-  if (!['reply', 'close', 'escalate'].includes(parsed.action)) throw new Error(`ИИ вернул неизвестный action: ${parsed.action}`);
+  if (!allowedActions.includes(parsed.action)) throw new Error(`ИИ вернул неизвестный action: ${parsed.action}`);
   if (parsed.action !== 'escalate' && !parsed.reply) throw new Error('ИИ вернул ответ без текста для игрока');
   return {
     action: parsed.action,
@@ -332,7 +449,7 @@ function parseVerdict(raw) {
   };
 }
 
-async function callOpenRouter(topicLabel, history) {
+async function callOpenRouter(systemPrompt, history) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 45_000);
   try {
@@ -348,7 +465,7 @@ async function callOpenRouter(topicLabel, history) {
         model: OPENROUTER_MODEL,
         temperature: 0.2,
         max_tokens: 1000,
-        messages: [{ role: 'system', content: buildSystemPrompt(topicLabel) }, ...history],
+        messages: [{ role: 'system', content: systemPrompt }, ...history],
       }),
     });
     if (!res.ok) {
@@ -364,14 +481,14 @@ async function callOpenRouter(topicLabel, history) {
   }
 }
 
-function scheduleAITriage(channel, meta) {
+function scheduleAITriage(channel, meta, delay = 4000) {
   if (aiTimers.has(channel.id)) clearTimeout(aiTimers.get(channel.id));
   aiTimers.set(
     channel.id,
     setTimeout(() => {
       aiTimers.delete(channel.id);
       runAITriage(channel, meta).catch((err) => console.error(`[AI] Сбой триажа: ${err.message}`));
-    }, 4000)
+    }, delay)
   );
 }
 
@@ -394,7 +511,7 @@ async function runAITriage(channel, meta) {
     const parts = (channel.topic || '').split('|');
     const topicLabel = parts[2]?.trim() || parts[1]?.trim() || 'Обращение';
     const history = await buildHistory(channel, meta.userId);
-    const verdict = await callOpenRouter(topicLabel, history);
+    const verdict = await callOpenRouter(buildSystemPrompt(topicLabel), history);
     if (humanTakeover.has(channel.id)) {
       console.log(`[AI] ${channel.name}: вердикт отброшен — ИИ отключён командой администрации.`);
       return;
@@ -580,6 +697,11 @@ client.once(Events.ClientReady, async (c) => {
       console.error(`[${guild.name}] Не удалось зарегистрировать команды: ${err.message}`);
     }
     await checkTicketSetup(guild);
+    if (AI_ENABLED && !(complaintLogChannels.get(guild.id) || COMPLAINTS_LOG_CHANNEL_ID)) {
+      console.warn(
+        `[${guild.name}] Канал приёма жалоб не настроен — запустите /setup-complaints-log в канале администрации (или задайте COMPLAINTS_LOG_CHANNEL_ID).`
+      );
+    }
     if (!(await canManageRole(guild))) continue;
 
     const members = await guild.members.fetch();
@@ -628,27 +750,19 @@ async function handleSetupTickets(i) {
   });
 }
 
-async function handleTicketCreate(i) {
-  await i.deferReply({ flags: MessageFlags.Ephemeral });
-  const topic = TICKET_TOPICS.find((t) => t.value === i.values[0]) || TICKET_TOPICS.at(-1);
-
-  let channels;
-  try {
-    channels = await i.guild.channels.fetch();
-  } catch {
-    channels = i.guild.channels.cache;
-  }
-  const existing = channels.find((c) => (c.topic || '').startsWith(`ticket:${i.user.id}`));
-  if (existing) {
-    await i.editReply({ content: `У вас уже есть открытый тикет: ${existing}` });
-    return;
-  }
-
-  const userName = i.user.username.toLowerCase().replace(/[^a-z0-9а-яё_-]/g, '').slice(0, 20) || i.user.id.slice(-6);
+function buildPrivateOverwrites(guild, authorId) {
+  const staffAllow = [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.ReadMessageHistory,
+    PermissionFlagsBits.AttachFiles,
+    PermissionFlagsBits.EmbedLinks,
+    PermissionFlagsBits.ManageMessages,
+  ];
   const overwrites = [
-    { id: i.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
     {
-      id: i.user.id,
+      id: authorId,
       allow: [
         PermissionFlagsBits.ViewChannel,
         PermissionFlagsBits.SendMessages,
@@ -670,17 +784,30 @@ async function handleTicketCreate(i) {
       ],
     },
   ];
-  const staffAllow = [
-    PermissionFlagsBits.ViewChannel,
-    PermissionFlagsBits.SendMessages,
-    PermissionFlagsBits.ReadMessageHistory,
-    PermissionFlagsBits.AttachFiles,
-    PermissionFlagsBits.EmbedLinks,
-    PermissionFlagsBits.ManageMessages,
-  ];
   for (const roleId of new Set([SUPPORT_ROLE_ID, STAFF_ROLE_ID])) {
     if (roleId) overwrites.push({ id: roleId, allow: staffAllow });
   }
+  return overwrites;
+}
+
+async function handleTicketCreate(i) {
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  const topic = TICKET_TOPICS.find((t) => t.value === i.values[0]) || TICKET_TOPICS.at(-1);
+
+  let channels;
+  try {
+    channels = await i.guild.channels.fetch();
+  } catch {
+    channels = i.guild.channels.cache;
+  }
+  const existing = channels.find((c) => (c.topic || '').startsWith(`ticket:${i.user.id}`));
+  if (existing) {
+    await i.editReply({ content: `У вас уже есть открытый тикет: ${existing}` });
+    return;
+  }
+
+  const userName = i.user.username.toLowerCase().replace(/[^a-z0-9а-яё_-]/g, '').slice(0, 20) || i.user.id.slice(-6);
+  const overwrites = buildPrivateOverwrites(i.guild, i.user.id);
 
   let channel;
   try {
@@ -709,7 +836,7 @@ async function handleTicketCreate(i) {
 }
 
 function parseTicketChannel(i) {
-  return parseTicketTopic(i.channel?.topic);
+  return parseChannelTopic(i.channel?.topic);
 }
 
 async function handleTicketClose(i) {
@@ -785,12 +912,300 @@ async function handleAIOff(i) {
   });
 }
 
+function buildComplaintSystemPrompt(meta) {
+  return [
+    `Ты — ИИ-модератор жалоб Discord-сервера Rust «${SERVER_NAME}». Ты работаешь в приватном канале, где игрок подал жалобу на другого игрока. Цель жалобы: ${meta.display}.`,
+    '',
+    '## Задача',
+    '1. Проверь полноту жалобы: описание нарушения, доказательства (видео/скриншоты — в переписке они видны как [вложение]), Steam ID нарушителя (SteamID64).',
+    '2. Чего-то не хватает → задай один конкретный вопрос (reply). Если автор просто спрашивает о процессе подачи — ответь по делу.',
+    '3. Жалоба полная (есть описание + доказательства) → сформулируй её и передай администрации (submit).',
+    '4. Это не жалоба, мусор, троллинг, попытка что-то разузнать или пустой вопрос → вежливо отклонить и закрыть (close).',
+    '',
+    '## Строго запрещено',
+    '- НИКОГДА не сообщай автору количество жалоб на любого игрока (в том числе на него самого) и не подтверждай существование других жалоб. Эта информация — только для администрации.',
+    '- Не выноси сам вердикт о наказании — только проверь жалобу и передай её администрации.',
+    '',
+    '## Правила сервера (для определения нарушенного пункта)',
+    AI_RULES,
+    '',
+    '## Формат ответа',
+    'Строго валидный JSON без текста вокруг:',
+    '{"action":"reply|submit|close","reply":"сообщение игроку на русском","reason":"краткое обоснование на русском","summary_en":"краткое резюме жалобы на английском для администрации","complaint_ru":"полная формулировка жалобы на русском: кто, на кого, что нарушил (со ссылкой на пункт правил), какие доказательства приложены"}',
+    'Для reply и close обязательны reply и reason; для submit обязательны summary_en и complaint_ru, а reply — короткое подтверждение игроку, что жалоба передана администрации.',
+  ].join('\n');
+}
+
+async function countActiveComplaints(guild, key) {
+  if (!key) return 1;
+  const channels = await guild.channels.fetch().catch(() => guild.channels.cache);
+  let n = 0;
+  for (const c of channels.values()) {
+    const meta = parseComplaintTopic(c.topic);
+    if (meta && meta.key === key) n++;
+  }
+  return n;
+}
+
+async function getComplaintLogChannel(guild) {
+  const id = complaintLogChannels.get(guild.id) || COMPLAINTS_LOG_CHANNEL_ID;
+  if (!id) return null;
+  const channel = await guild.channels.fetch(id).catch(() => null);
+  return channel && channel.isTextBased?.() ? channel : null;
+}
+
+async function postComplaintToLog(channel, meta, verdict) {
+  const log = await getComplaintLogChannel(channel.guild);
+  const count = await countActiveComplaints(channel.guild, meta.key);
+  const link = `https://discord.com/channels/${channel.guild.id}/${channel.id}`;
+  const lines = [
+    '🔴 **New player complaint**',
+    '',
+    STAFF_ROLE_ID ? `<@&${STAFF_ROLE_ID}> — please review this complaint.` : '**Please review this complaint.**',
+    `- **Target:** ${meta.display}`,
+    `- **Author:** <@${meta.userId}>`,
+    `- **Active complaints on this player:** **${count}** (including this one)`,
+    verdict.summary_en ? `- **AI assessment:** ${verdict.summary_en}` : null,
+    '',
+    verdict.complaint_ru
+      ? `**Жалоба (сформулирована ИИ):**\n${verdict.complaint_ru}`
+      : '**Жалоба без ИИ-формулировки — оригинал в канале жалобы.**',
+    '',
+    `**Чат жалобы:** ${link}`,
+    '-# AI triage — final decision is up to staff. Evidence is attached in the complaint channel.',
+  ].filter(Boolean);
+
+  if (!log) {
+    console.error(`[${channel.guild.name}] Канал приёма жалоб не настроен — запустите /setup-complaints-log в канале администрации.`);
+    await channel
+      .send('⚠️ Канал администрации для жалоб не настроен — жалоба будет рассмотрена прямо в этом канале.')
+      .catch(() => {});
+    if (STAFF_ROLE_ID) {
+      await channel
+        .send({ content: `<@&${STAFF_ROLE_ID}> — жалоба требует рассмотрения.`, allowedMentions: { roles: [STAFF_ROLE_ID] } })
+        .catch(() => {});
+    }
+    return;
+  }
+
+  await log.send({ content: lines.join('\n'), allowedMentions: { parse: ['users'], roles: STAFF_ROLE_ID ? [STAFF_ROLE_ID] : [] } });
+  console.log(`[${channel.guild.name}] Жалоба отправлена в «${log.name}» — актуальных жалоб на игрока: ${count}`);
+}
+
+function scheduleComplaintTriage(channel, meta, delay = 4000) {
+  if (aiTimers.has(channel.id)) clearTimeout(aiTimers.get(channel.id));
+  aiTimers.set(
+    channel.id,
+    setTimeout(() => {
+      aiTimers.delete(channel.id);
+      runComplaintTriage(channel, meta).catch((err) => console.error(`[AI:жалобы] Сбой триажа: ${err.message}`));
+    }, delay)
+  );
+}
+
+async function runComplaintTriage(channel, meta) {
+  if (aiBusy.has(channel.id)) {
+    scheduleComplaintTriage(channel, meta);
+    return;
+  }
+  aiBusy.add(channel.id);
+  try {
+    if (humanTakeover.has(channel.id)) return;
+    const history = await buildHistory(channel, meta.userId);
+    const verdict = await callOpenRouter(buildComplaintSystemPrompt(meta), history);
+    if (humanTakeover.has(channel.id)) {
+      console.log(`[AI:жалобы] ${channel.name}: вердикт отброшен — ИИ отключён администрацией.`);
+      return;
+    }
+    console.log(`[AI:жалобы] ${channel.name}: ${verdict.action} — ${verdict.reason}`);
+    await applyComplaintVerdict(channel, meta, verdict);
+  } catch (err) {
+    console.error(`[AI:жалобы] Ошибка триажа (${channel.name}): ${err.message}`);
+    humanTakeover.add(channel.id);
+    await postComplaintToLog(channel, meta, {
+      summary_en: 'AI validation failed — raw complaint forwarded for manual review.',
+      complaint_ru: null,
+    }).catch(() => {});
+    await channel
+      .send('Жалоба передана администрации — здесь с вами свяжутся. Прикрепите доказательства, если ещё не сделали этого.')
+      .catch(() => {});
+  } finally {
+    aiBusy.delete(channel.id);
+  }
+}
+
+async function applyComplaintVerdict(channel, meta, verdict) {
+  if (verdict.action === 'close') {
+    if (idleCloseTimers.has(channel.id)) {
+      clearTimeout(idleCloseTimers.get(channel.id));
+      idleCloseTimers.delete(channel.id);
+    }
+    await channel.send(
+      `${verdict.reply || 'Жалоба закрыта.'}\n\n-# Если это ошибка — напишите сообщение в ближайшие 20 секунд, и автозакрытие отменится.`
+    );
+    await channel.send({ components: [ticketClosedPanel(20)], flags: MessageFlags.IsComponentsV2 });
+    scheduleChannelClose(channel, 20_000);
+  } else if (verdict.action === 'submit') {
+    humanTakeover.add(channel.id);
+    if (idleCloseTimers.has(channel.id)) {
+      clearTimeout(idleCloseTimers.get(channel.id));
+      idleCloseTimers.delete(channel.id);
+    }
+    await postComplaintToLog(channel, meta, verdict);
+    await channel.send(verdict.reply || 'Жалоба проверена и передана администрации — с вами свяжутся в этом канале.');
+  } else {
+    await channel.send(verdict.reply);
+    scheduleIdleClose(channel);
+  }
+}
+
+async function handleSetupComplaints(i) {
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  const message = await i.channel.send({ components: [complaintsPanel()], flags: MessageFlags.IsComponentsV2 });
+  let pinned = true;
+  try {
+    await message.pin();
+  } catch {
+    pinned = false;
+  }
+  await i.editReply({
+    content: pinned
+      ? 'Панель жалоб опубликована и закреплена в этом канале.'
+      : 'Панель опубликована, но закрепить не удалось — боту не хватает права «Управлять сообщениями».',
+  });
+}
+
+async function handleSetupComplaintsLog(i) {
+  complaintLogChannels.set(i.guildId, i.channelId);
+  saveState();
+  const envNote = COMPLAINTS_LOG_CHANNEL_ID
+    ? ''
+    : '\n-# Надёжнее также задать переменную COMPLAINTS_LOG_CHANNEL_ID на Railway — после редеплоя канал мог сброситься.';
+  await i.reply({
+    content: `✅ Этот канал назначен каналом приёма жалоб: сюда ИИ будет присылать проверенные жалобы, счётчик актуальных жалоб и ссылку на канал общения.${envNote}`,
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function handleComplaintOpen(i) {
+  const modal = new ModalBuilder().setCustomId('complaint_modal').setTitle('Жалоба на игрока');
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId('target_nick')
+        .setLabel('Ник игрока')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(100)
+        .setPlaceholder('Например: SwagPlayer228')
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId('target_steam')
+        .setLabel('Steam ID (SteamID64), если известен')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setMaxLength(100)
+        .setPlaceholder('76561198…')
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId('description')
+        .setLabel('Что случилось?')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+        .setMaxLength(1000)
+        .setPlaceholder('Опишите нарушение: когда, где и что произошло')
+    )
+  );
+  await i.showModal(modal);
+}
+
+async function handleComplaintModalSubmit(i) {
+  const nick = (i.fields.getTextInputValue('target_nick') || '').trim().replace(/\|/g, '/').slice(0, 100);
+  const steamRaw = (i.fields.getTextInputValue('target_steam') || '').trim().slice(0, 100);
+  const description = (i.fields.getTextInputValue('description') || '').trim().slice(0, 1000);
+  if (!nick) {
+    await i.reply({ content: 'Укажите ник игрока.', flags: MessageFlags.Ephemeral });
+    return;
+  }
+
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+
+  let channels;
+  try {
+    channels = await i.guild.channels.fetch();
+  } catch {
+    channels = i.guild.channels.cache;
+  }
+  const existing = channels.find((c) => (c.topic || '').startsWith(`complaint:${i.user.id}`));
+  if (existing) {
+    await i.editReply({ content: `У вас уже есть открытая жалоба: ${existing}` });
+    return;
+  }
+
+  const steamMatch = steamRaw.match(/\d{15,18}/);
+  const steamId = steamMatch ? steamMatch[0] : steamRaw.replace(/\|/g, '/');
+  const key = steamMatch ? steamMatch[0] : nick.toLowerCase();
+  const display = steamId ? `${nick} · ${steamId}` : nick;
+  const cleanNick = nick.toLowerCase().replace(/[^a-z0-9а-яё_-]/g, '').slice(0, 20) || 'игрок';
+
+  let channel;
+  try {
+    channel = await i.guild.channels.create({
+      name: `жалоба-${cleanNick}`.slice(0, 100),
+      type: ChannelType.GuildText,
+      topic: `complaint:${i.user.id}|${key}|${display}`,
+      parent: TICKET_CATEGORY_ID || undefined,
+      permissionOverwrites: buildPrivateOverwrites(i.guild, i.user.id),
+    });
+  } catch (err) {
+    if (err.code === 50013 || err.code === '50013') {
+      await i.editReply({
+        content:
+          'Не хватает прав на создание канала. Пригласите бота заново с правом «Управление каналами» (Discord Developer Portal → OAuth2 → URL Generator → bot → Manage Channels).',
+      });
+    } else {
+      throw err;
+    }
+    return;
+  }
+
+  await channel.send({ components: [complaintWelcomePanel(i.member, display)], flags: MessageFlags.IsComponentsV2 });
+  await channel.send(
+    [`**Цель жалобы:** ${display}`, `**От кого:** ${i.member}`, `**Описание:** ${description}`].join('\n')
+  );
+
+  const meta = { kind: 'complaint', userId: i.user.id, key, display };
+  if (!AI_ENABLED) {
+    humanTakeover.add(channel.id);
+    await postComplaintToLog(channel, meta, {
+      summary_en: 'No AI validation configured — raw complaint forwarded.',
+      complaint_ru: null,
+    }).catch(() => {});
+  } else {
+    scheduleComplaintTriage(channel, meta, 20_000);
+  }
+  console.log(`[${i.guild.name}] Жалоба создана: ${channel.name} (${i.user.tag})`);
+  await i.editReply({
+    content: `Жалоба создана: ${channel} — отправьте доказательства (видео или скриншоты) в этот канал.`,
+  });
+}
+
 client.on(Events.InteractionCreate, async (i) => {
   try {
     if (i.isChatInputCommand() && i.commandName === 'setup-tickets') {
       await handleSetupTickets(i);
     } else if (i.isChatInputCommand() && i.commandName === 'ai-off') {
       await handleAIOff(i);
+    } else if (i.isChatInputCommand() && i.commandName === 'setup-complaints') {
+      await handleSetupComplaints(i);
+    } else if (i.isChatInputCommand() && i.commandName === 'setup-complaints-log') {
+      await handleSetupComplaintsLog(i);
+    } else if (i.isButton() && i.customId === 'complaint_open') {
+      await handleComplaintOpen(i);
+    } else if (i.isModalSubmit() && i.customId === 'complaint_modal') {
+      await handleComplaintModalSubmit(i);
     } else if (i.isStringSelectMenu() && i.customId === 'ticket_create') {
       await handleTicketCreate(i);
     } else if (i.isButton() && i.customId === 'ticket_close') {
@@ -813,7 +1228,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
 client.on(Events.MessageCreate, async (msg) => {
   if (!msg.inGuild() || msg.author.bot) return;
-  const meta = parseTicketTopic(msg.channel.topic);
+  const meta = parseChannelTopic(msg.channel.topic);
   if (!meta || msg.author.id !== meta.userId) return;
 
   if (closeTimers.has(msg.channelId)) {
@@ -834,7 +1249,11 @@ client.on(Events.MessageCreate, async (msg) => {
   }
 
   if (humanTakeover.has(msg.channelId)) return;
-  scheduleAITriage(msg.channel, meta);
+  if (meta.kind === 'complaint') {
+    scheduleComplaintTriage(msg.channel, meta);
+  } else {
+    scheduleAITriage(msg.channel, meta);
+  }
 });
 
 client.on(Events.ChannelDelete, (channel) => {
