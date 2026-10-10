@@ -19,6 +19,7 @@ import {
   TextInputBuilder,
   TextInputStyle,
 } from 'discord.js';
+import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import 'dotenv/config';
@@ -74,6 +75,7 @@ const SERVER_SITE = process.env.SERVER_SITE?.trim() || 'https://swagrust.ru/';
 const AI_RULES = (process.env.AI_RULES?.trim() || DEFAULT_RULES).replace(/\\n/g, '\n');
 const AI_IDLE_CLOSE_MINUTES = parseInt(process.env.AI_IDLE_CLOSE_MINUTES || '5', 10);
 const COMPLAINTS_LOG_CHANNEL_ID = process.env.COMPLAINTS_LOG_CHANNEL_ID?.trim() || null;
+const GAME_API_SECRET = process.env.GAME_API_SECRET?.trim() || null;
 const AI_ENABLED = Boolean(OPENROUTER_API_KEY);
 
 if (!TOKEN) {
@@ -132,6 +134,18 @@ const COMMANDS = [
     .setDescription('Назначить этот канал каналом приёма жалоб для администрации')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .toJSON(),
+  new SlashCommandBuilder()
+    .setName('game-reports')
+    .setDescription('Сколько репортов висит на игроке в игре (живые данные сервера)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption((o) => o.setName('query').setDescription('Ник или Steam ID игрока').setRequired(true))
+    .toJSON(),
+  new SlashCommandBuilder()
+    .setName('game-players')
+    .setDescription('Поиск игроков игрового сервера по нику или Steam ID')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption((o) => o.setName('query').setDescription('Ник или Steam ID').setRequired(true))
+    .toJSON(),
 ];
 
 const acknowledgedTickets = new Set();
@@ -161,6 +175,157 @@ function saveState() {
   } catch (err) {
     console.error('Не удалось сохранить data/state.json:', err.message);
   }
+}
+
+const gameState = {
+  updatedAt: 0,
+  firstSync: true,
+  players: new Map(),
+  reports: [],
+  verified: new Map(),
+  activeChecks: [],
+};
+const knownGameReportKeys = new Set();
+const gameCommandQueue = [];
+let gameCommandSeq = 0;
+
+function gameConnected() {
+  return gameState.updatedAt > 0 && Date.now() - gameState.updatedAt < 3 * 60_000;
+}
+
+function gameReportsFor(targetId) {
+  return gameState.reports.filter((r) => r.targetId === targetId);
+}
+
+function findGamePlayers(query, limit = 10) {
+  const q = query.trim().toLowerCase();
+  if (!q) return [];
+  const found = [];
+  for (const p of gameState.players.values()) {
+    if ((p.name || '').toLowerCase().includes(q) || (p.id || '').includes(q)) {
+      found.push(p);
+      if (found.length >= limit) break;
+    }
+  }
+  return found;
+}
+
+function enqueueGameCommand(cmd) {
+  gameCommandQueue.push({ id: `cmd${++gameCommandSeq}`, ...cmd });
+  console.log(`[API:игра] Команда поставлена в очередь: ${cmd.type}`);
+}
+
+async function announceInGameReport(report, total) {
+  for (const guild of client.guilds.cache.values()) {
+    const log = await getComplaintLogChannel(guild).catch(() => null);
+    if (!log) continue;
+    const lines = [
+      '🎮 **In-game report received**',
+      '',
+      STAFF_ROLE_ID ? `<@&${STAFF_ROLE_ID}> — new report from the game server.` : '**New report from the game server.**',
+      `- **Target:** ${report.targetName} (${report.targetId}) — **${total}** in-game reports total`,
+      `- **By:** ${report.reporterName}`,
+      `- **Reason:** ${report.reason}`,
+      `- **Time:** <t:${report.unixTime}:R>`,
+      '',
+      '-# Player list and full stats: /game-reports, /game-players.',
+    ];
+    await log
+      .send({ content: lines.join('\n'), allowedMentions: { roles: STAFF_ROLE_ID ? [STAFF_ROLE_ID] : [] } })
+      .catch((err) => console.error(`[API:игра] Не удалось отправить анонс репорта: ${err.message}`));
+  }
+}
+
+async function applyGameSnapshot(payload) {
+  gameState.updatedAt = Date.now();
+  gameState.players = new Map((payload.players || []).map((p) => [p.id, p]));
+  gameState.reports = payload.reports || [];
+  gameState.verified = new Map((payload.verified || []).map((v) => [v.id, v.until]));
+  gameState.activeChecks = payload.activeChecks || [];
+
+  for (const r of payload.results || []) {
+    if (r?.result && r.result.ok === false) {
+      console.error(`[API:игра] Команда ${r.type} (${r.id}) не выполнена: ${r.result.error}`);
+    }
+  }
+
+  if (gameState.firstSync) {
+    gameState.firstSync = false;
+    for (const r of gameState.reports) knownGameReportKeys.add(r.key);
+    console.log(`[API:игра] Первый снимок: игроков ${gameState.players.size}, репортов ${gameState.reports.length}, проверок ${gameState.activeChecks.length}.`);
+    return;
+  }
+
+  for (const r of gameState.reports) {
+    if (knownGameReportKeys.has(r.key)) continue;
+    knownGameReportKeys.add(r.key);
+    if (String(r.reporterId) === '0') continue;
+    const total = gameState.reports.filter((x) => x.targetId === r.targetId).length;
+    await announceInGameReport(r, total).catch(() => {});
+  }
+}
+
+function startApiServer() {
+  const port = parseInt(process.env.PORT || '3000', 10);
+  if (!Number.isFinite(port)) return;
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      if (req.method === 'GET' && req.url === '/api/health') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('ok');
+        return;
+      }
+
+      if (req.method !== 'POST' || req.url !== '/api/report') {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('not found');
+        return;
+      }
+
+      if (!GAME_API_SECRET) {
+        res.writeHead(503, { 'Content-Type': 'text/plain' });
+        res.end('game api disabled');
+        return;
+      }
+      if (req.headers.authorization !== `Bearer ${GAME_API_SECRET}`) {
+        res.writeHead(401, { 'Content-Type': 'text/plain' });
+        res.end('unauthorized');
+        return;
+      }
+
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      if (body.length > 5_000_000) {
+        res.writeHead(413, { 'Content-Type': 'text/plain' });
+        res.end('too large');
+        return;
+      }
+      let payload;
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('bad json');
+        return;
+      }
+
+      await applyGameSnapshot(payload);
+      const commands = gameCommandQueue.splice(0, 10);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ commands }));
+    } catch (err) {
+      console.error('[API:игра] Ошибка обработки запроса:', err.message);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('internal error');
+      }
+    }
+  });
+
+  server.listen(port, () => {
+    console.log(`API игрового сервера слушает порт ${port}${GAME_API_SECRET ? ' (секрет задан)' : ' (секрет НЕ задан — плагин не подключится)'}`);
+  });
 }
 
 function parseTicketTopic(topic) {
@@ -960,6 +1125,24 @@ async function postComplaintToLog(channel, meta, verdict) {
   const log = await getComplaintLogChannel(channel.guild);
   const count = await countActiveComplaints(channel.guild, meta.key);
   const link = `https://discord.com/channels/${channel.guild.id}/${channel.id}`;
+
+  const steamKey = /^\d{15,18}$/.test(meta.key) ? meta.key : null;
+  const gameOnline = gameConnected();
+  const inGameReports = steamKey ? gameReportsFor(steamKey).length : 0;
+  let syncingToGame = false;
+  if (gameOnline && steamKey) {
+    const nick = meta.display.split(' · ')[0] || meta.display;
+    const author = await channel.guild.members.fetch(meta.userId).catch(() => null);
+    enqueueGameCommand({
+      type: 'add_report',
+      targetId: steamKey,
+      targetName: nick,
+      reporterName: author?.user?.username || 'unknown',
+      reason: 'Жалоба из Discord',
+    });
+    syncingToGame = true;
+  }
+
   const lines = [
     '🔴 **New player complaint**',
     '',
@@ -967,6 +1150,7 @@ async function postComplaintToLog(channel, meta, verdict) {
     `- **Target:** ${meta.display}`,
     `- **Author:** <@${meta.userId}>`,
     `- **Active complaints on this player:** **${count}** (including this one)`,
+    gameOnline && steamKey ? `- **In-game reports on this player:** **${inGameReports}**${syncingToGame ? ' (+1 syncing)' : ''}` : null,
     verdict.summary_en ? `- **AI assessment:** ${verdict.summary_en}` : null,
     '',
     verdict.complaint_ru
@@ -1194,6 +1378,76 @@ async function handleComplaintModalSubmit(i) {
   });
 }
 
+async function handleGameReports(i) {
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  if (!gameConnected()) {
+    await i.editReply({
+      content: 'Игровой сервер не подключён (нет свежих данных за последние 3 минуты). Проверьте: домен Railway, секрет GAME_API_SECRET и конфиг плагина GlassReportCheck.',
+    });
+    return;
+  }
+
+  const query = i.options.getString('query');
+  const matches = findGamePlayers(query, 5);
+  if (!matches.length) {
+    await i.editReply({
+      content: `Игрок «${query}» не найден в базе игрового сервера. Попробуйте точный ник или полный Steam ID.`,
+    });
+    return;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const lines = ['# 📊 Репорты в игре'];
+  for (const p of matches) {
+    const reports = gameReportsFor(p.id);
+    const verifiedUntil = gameState.verified.get(p.id) || 0;
+    const onCheck = gameState.activeChecks.find((c) => c.targetId === p.id);
+    const status = [
+      p.online ? '🟢 В сети' : '⚪ Не в сети',
+      verifiedUntil > now ? `✓ Проверен (до <t:${verifiedUntil}:R>)` : null,
+      onCheck ? `🔍 На проверке у ${onCheck.moderatorName}` : null,
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    lines.push(`### ${p.name} · ${p.id}`, `- ${status}`, `- Актуальных репортов: **${reports.length}**`);
+    const latest = [...reports].sort((a, b) => b.unixTime - a.unixTime).slice(0, 5);
+    for (const r of latest) {
+      lines.push(`- ${r.reason} — от ${r.reporterName} · <t:${r.unixTime}:R>`);
+    }
+  }
+  lines.push('', `-# Данные игры обновлены <t:${Math.floor(gameState.updatedAt / 1000)}:R>`);
+  await i.editReply({ content: lines.join('\n') });
+}
+
+async function handleGamePlayers(i) {
+  await i.deferReply({ flags: MessageFlags.Ephemeral });
+  if (!gameConnected()) {
+    await i.editReply({
+      content: 'Игровой сервер не подключён (нет свежих данных за последние 3 минуты). Проверьте: домен Railway, секрет GAME_API_SECRET и конфиг плагина GlassReportCheck.',
+    });
+    return;
+  }
+
+  const query = i.options.getString('query');
+  const matches = findGamePlayers(query, 10);
+  if (!matches.length) {
+    await i.editReply({ content: `По запросу «${query}» игроков не найдено.` });
+    return;
+  }
+
+  const sorted = matches.sort((a, b) => Number(b.online) - Number(a.online) || (a.name || '').localeCompare(b.name || ''));
+  const lines = [
+    `# 🎮 Игроки сервера (найдено: ${matches.length})`,
+    ...sorted.map(
+      (p) =>
+        `- **${p.name}** — \`${p.id}\` · ${p.online ? '🟢' : '⚪'} · был в игре <t:${p.lastSeen}:R> · репортов: ${gameReportsFor(p.id).length}`
+    ),
+    '',
+    `-# Данные игры обновлены <t:${Math.floor(gameState.updatedAt / 1000)}:R> · Подробно: /game-reports`,
+  ];
+  await i.editReply({ content: lines.join('\n') });
+}
+
 client.on(Events.InteractionCreate, async (i) => {
   try {
     if (i.isChatInputCommand() && i.commandName === 'setup-tickets') {
@@ -1204,6 +1458,10 @@ client.on(Events.InteractionCreate, async (i) => {
       await handleSetupComplaints(i);
     } else if (i.isChatInputCommand() && i.commandName === 'setup-complaints-log') {
       await handleSetupComplaintsLog(i);
+    } else if (i.isChatInputCommand() && i.commandName === 'game-reports') {
+      await handleGameReports(i);
+    } else if (i.isChatInputCommand() && i.commandName === 'game-players') {
+      await handleGamePlayers(i);
     } else if (i.isButton() && i.customId === 'complaint_open') {
       await handleComplaintOpen(i);
     } else if (i.isModalSubmit() && i.customId === 'complaint_modal') {
@@ -1269,5 +1527,7 @@ client.on(Events.ChannelDelete, (channel) => {
   humanTakeover.delete(channel.id);
   acknowledgedTickets.delete(channel.id);
 });
+
+startApiServer();
 
 client.login(TOKEN);
