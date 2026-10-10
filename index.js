@@ -1,19 +1,21 @@
 import { Client, Events, GatewayIntentBits } from 'discord.js';
 import 'dotenv/config';
 
-const TOKEN = process.env.TOKEN;
-const ROLE_ID = process.env.ROLE_ID;
+const TOKEN = process.env.TOKEN?.trim();
+const ROLE_ID = process.env.ROLE_ID?.trim();
 
 if (!TOKEN) {
-  console.error('Ошибка: не указан TOKEN в файле .env');
+  console.error('Ошибка: не задан TOKEN. Добавьте переменную TOKEN на Railway (вкладка Variables) или в файл .env.');
   process.exit(1);
 }
-if (!/^[A-Za-z0-9_-]{50,}$/.test(TOKEN)) {
-  console.error('Ошибка: TOKEN в .env выглядит неверным. Скопируйте токен бота из Discord Developer Portal.');
+if (!/^[A-Za-z0-9_.-]{50,}$/.test(TOKEN)) {
+  console.error(
+    'Ошибка: TOKEN выглядит неверным. Скопируйте токен заново из Discord Developer Portal (Bot → Reset Token) — без кавычек и лишних символов.'
+  );
   process.exit(1);
 }
 if (!ROLE_ID) {
-  console.error('Ошибка: не указан ROLE_ID в файле .env');
+  console.error('Ошибка: не задан ROLE_ID. Добавьте переменную ROLE_ID на Railway (вкладка Variables) или в файл .env.');
   process.exit(1);
 }
 
