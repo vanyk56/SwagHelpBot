@@ -11,7 +11,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("GlassReportCheck", "OpenAI", "1.4.0")]
+    [Info("GlassReportCheck", "OpenAI", "1.4.1")]
     [Description("Glass-style report and moderation check system with freeze and god mode + Discord API bridge.")]
     public class GlassReportCheck : RustPlugin
     {
@@ -431,6 +431,14 @@ namespace Oxide.Plugins
         private readonly List<object> _apiResults = new List<object>();
         private float _nextApiWarn;
 
+        private string BotApiBase()
+        {
+            var url = (_config.BotApiUrl ?? string.Empty).Trim().TrimEnd('/');
+            if (url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                return url;
+            return "https://" + url;
+        }
+
         private void StartBotPolling()
         {
             if (string.IsNullOrWhiteSpace(_config.BotApiUrl) || string.IsNullOrWhiteSpace(_config.BotApiSecret))
@@ -441,7 +449,7 @@ namespace Oxide.Plugins
 
             _apiPolling = true;
             var interval = Mathf.Clamp(_config.BotPollInterval, 5, 300);
-            Puts($"Интеграция с Discord-ботом включена: опрос {_config.BotApiUrl} каждые {interval} сек.");
+            Puts($"Интеграция с Discord-ботом включена: опрос {BotApiBase()} каждые {interval} сек.");
             timer.Every(interval, PollBotApi);
         }
 
@@ -462,7 +470,7 @@ namespace Oxide.Plugins
                 return;
             }
 
-            webrequest.EnqueuePost(_config.BotApiUrl.TrimEnd('/') + "/api/report", body, (code, response) =>
+            webrequest.EnqueuePost(BotApiBase() + "/api/report", body, (code, response) =>
             {
                 if (code != 200 || string.IsNullOrEmpty(response))
                 {
