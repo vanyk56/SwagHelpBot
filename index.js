@@ -396,7 +396,7 @@ function complaintsPanel() {
           '> Опишите нарушение и приложите доказательства — жалоба уйдёт администрации приватно.',
           '▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬',
           '- 📹 Приложите **видео или скриншоты** нарушения',
-          '- 🆔 Укажите **ник и Steam ID** игрока',
+          '- 🆔 Укажите **ник игрока и Steam ID** — если ID неизвестен, бот найдёт игрока по нику',
           '- 🔒 Всё **строго конфиденциально** — игрок не узнает, кто пожаловался',
           '',
           '-# Ложные жалобы и обращения «просто узнать информацию» не рассматриваются.',
@@ -427,7 +427,7 @@ function complaintWelcomePanel(member, display) {
           '▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬',
           '### Что нужно для рассмотрения',
           '- 📹 **Видео или скриншоты** нарушения — жалоба без доказательств не рассматривается',
-          '- 🆔 **Steam ID** игрока — если не указали при создании',
+          '- 🆔 **Steam ID** игрока — если не указали, ИИ уточнит личность нарушителя по базе игрового сервера',
           '',
           '> Информация по жалобам строго конфиденциальна и не разглашается.',
           '',
@@ -657,10 +657,15 @@ function parseVerdict(raw, allowedActions = ['reply', 'close', 'escalate']) {
     reply: parsed.reply?.trim() || '',
     reason: parsed.reason?.trim() || '',
     summary_en: parsed.summary_en?.trim() || '',
+    complaint_ru: parsed.complaint_ru?.trim() || '',
+    resolved:
+      parsed.resolved && typeof parsed.resolved === 'object'
+        ? { id: String(parsed.resolved.id || '').trim(), name: String(parsed.resolved.name || '').trim() }
+        : null,
   };
 }
 
-async function callOpenRouter(systemPrompt, history) {
+async function callOpenRouter(systemPrompt, history, allowedActions) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 45_000);
   try {
@@ -686,7 +691,7 @@ async function callOpenRouter(systemPrompt, history) {
     const data = await res.json();
     const raw = data.choices?.[0]?.message?.content;
     if (!raw) throw new Error('пустой ответ модели');
-    return parseVerdict(raw);
+    return parseVerdict(raw, allowedActions);
   } finally {
     clearTimeout(timer);
   }
@@ -1123,15 +1128,128 @@ async function handleAIOff(i) {
   });
 }
 
-function buildComplaintSystemPrompt(meta) {
+const STEAM_ID_RE = /^\d{15,18}$/;
+
+function complaintNick(meta) {
+  return (meta.display || '').split(' · ')[0].trim();
+}
+
+function sanitizeGameName(name) {
+  return String(name || '').replace(/\|/g, '/').trim().slice(0, 100);
+}
+
+function exactGamePlayerByNick(nick) {
+  const q = (nick || '').trim().toLowerCase();
+  if (!q || !gameConnected()) return null;
+  let match = null;
+  for (const p of gameState.players.values()) {
+    if ((p.name || '').trim().toLowerCase() === q) {
+      if (match) return null;
+      match = p;
+    }
+  }
+  return match;
+}
+
+function complaintCandidatesFor(meta, history) {
+  const list = new Map();
+  const nick = complaintNick(meta);
+  if (nick) {
+    for (const p of findGamePlayers(nick, 5)) list.set(p.id, p);
+  }
+  for (const m of history.slice(-20)) {
+    if (m.role !== 'user') continue;
+    const text =
+      typeof m.content === 'string'
+        ? m.content
+        : Array.isArray(m.content)
+          ? m.content.map((p) => p.text || '').join(' ')
+          : '';
+    for (const idm of text.matchAll(/\b\d{15,18}\b/g)) {
+      for (const p of findGamePlayers(idm[0], 3)) list.set(p.id, p);
+    }
+  }
+  return [...list.values()].slice(0, 8);
+}
+
+async function applyResolvedTarget(channel, meta, resolved) {
+  const id = (resolved?.id || '').trim();
+  if (!STEAM_ID_RE.test(id)) return meta;
+  const known = gameState.players.get(id);
+  if (!known) {
+    console.warn(`[AI:жалобы] ${channel.name}: ИИ указал игрока вне базы игрового сервера (${id}) — идентификация отклонена.`);
+    return meta;
+  }
+  const name = sanitizeGameName(resolved.name) || sanitizeGameName(known.name) || id;
+  const display = `${name} · ${id}`;
+  try {
+    await channel.setTopic(`complaint:${meta.userId}|${id}|${display}`, 'Жалоба: личность нарушителя уточнена');
+  } catch (err) {
+    console.error(`[AI:жалобы] ${channel.name}: не удалось обновить тему канала: ${err.message}`);
+    return meta;
+  }
+  await channel.send(`-# ✅ Личность нарушителя уточнена: **${name}** · \`${id}\``).catch(() => {});
+  console.log(`[AI:жалобы] ${channel.name}: цель жалобы уточнена — ${display}`);
+  return { kind: 'complaint', userId: meta.userId, key: id, display };
+}
+
+async function tryAutoResolveComplaint(channel, meta) {
+  if (STEAM_ID_RE.test(meta.key)) return meta;
+  const exact = exactGamePlayerByNick(complaintNick(meta));
+  if (!exact) return meta;
+  return applyResolvedTarget(channel, meta, { id: exact.id, name: exact.name });
+}
+
+function buildIdentitySection(meta, candidates) {
+  const nick = complaintNick(meta);
+  if (STEAM_ID_RE.test(meta.key)) {
+    const known = gameConnected() ? gameState.players.get(meta.key) : null;
+    return known
+      ? [
+          '## Личность нарушителя — установлена',
+          `Нарушитель идентифицирован: точный ник «${sanitizeGameName(known.name)}», Steam ID ${known.id}${known.online ? ', сейчас в сети' : ''}. Используй именно эти данные и не переспрашивай автора.`,
+        ]
+      : ['## Личность нарушителя — установлена', `Нарушитель идентифицирован по Steam ID: ${meta.key}.`];
+  }
+  if (!gameConnected()) {
+    return [
+      '## Личность нарушителя',
+      `Автор указал только ник «${nick}». Игровой сервер сейчас не подключён — проверить личность по базе игроков нельзя. Действуй по общим правилам жалобы.`,
+    ];
+  }
+  if (candidates.length) {
+    const list = candidates
+      .map((p, idx) => `${idx + 1}. «${sanitizeGameName(p.name)}» — Steam ID ${p.id}${p.online ? ' · сейчас в сети' : ''}`)
+      .join('\n');
+    return [
+      '## Личность нарушителя — нужно уточнение',
+      `Автор указал только ник «${nick}» — Steam ID неизвестен. База игроков игрового сервера нашла кандидатов:`,
+      list,
+      '',
+      'Порядок действий:',
+      '1. Пока автор не подтвердил личность — спроси его (reply), кого он имел в виду: назови кандидатов с их Steam ID и попроси подтвердить. Одно короткое сообщение.',
+      '2. Автор подтвердил («да», назвал точный ник или Steam ID) → добавь в JSON-ответ поле "resolved" с id строго из списка выше и продолжай обычную проверку жалобы.',
+      '3. Никто из кандидатов не подходит → попроси точный ник или Steam ID игрока.',
+      '4. Автор не может уточнить — не отклоняй жалобу из-за этого: проверь доказательства и передай администрации (submit) без "resolved", личность установит администрация.',
+    ];
+  }
+  return [
+    '## Личность нарушителя',
+    `Автор указал только ник «${nick}», но такого игрока нет в актуальной базе игрового сервера. Один раз попроси точный ник или Steam ID; если автор не знает — продолжай проверку и передай жалобу как есть.`,
+  ];
+}
+
+function buildComplaintSystemPrompt(meta, candidates = []) {
   return [
     `Ты — ИИ-модератор жалоб Discord-сервера Rust «${SERVER_NAME}». Ты работаешь в приватном канале, где игрок подал жалобу на другого игрока. Цель жалобы: ${meta.display}.`,
     '',
     '## Задача',
-    '1. Проверь полноту жалобы: описание нарушения, Steam ID нарушителя (SteamID64) и доказательства. Скриншоты приходят тебе как изображения — рассматривай их и проверяй, действительно ли на них видно нарушение. Видео ты не видишь: это тоже доказательство, но оценивай его по описанию автора.',
+    '1. Проверь полноту жалобы: описание нарушения, личность нарушителя (см. раздел идентификации ниже) и доказательства. Скриншоты приходят тебе как изображения — рассматривай их и проверяй, действительно ли на них видно нарушение. Видео ты не видишь: это тоже доказательство, но оценивай его по описанию автора.',
     '2. Чего-то не хватает → задай один конкретный вопрос (reply). Если автор просто спрашивает о процессе подачи — ответь по делу.',
     '3. Жалоба полная (описание + доказательства, скриншот подтверждает или не противоречит) → сформулируй её и передай администрации (submit). Если скриншот явно НЕ подтверждает жалобу или выглядит подделкой — всё равно передай администрации с пометкой в summary_en (submit), решение за людьми.',
     '4. Это не жалоба, мусор, троллинг, попытка что-то разузнать или пустой вопрос → вежливо отклонить и закрыть (close).',
+    '',
+    ...buildIdentitySection(meta, candidates),
     '',
     '## Строго запрещено',
     '- НИКОГДА не сообщай автору количество жалоб на любого игрока (в том числе на него самого) и не подтверждай существование других жалоб. Эта информация — только для администрации.',
@@ -1142,7 +1260,8 @@ function buildComplaintSystemPrompt(meta) {
     '',
     '## Формат ответа',
     'Строго валидный JSON без текста вокруг:',
-    '{"action":"reply|submit|close","reply":"сообщение игроку на русском","reason":"краткое обоснование на русском","summary_en":"краткое резюме жалобы на английском для администрации","complaint_ru":"полная формулировка жалобы на русском: кто, на кого, что нарушил (со ссылкой на пункт правил), какие доказательства приложены"}',
+    '{"action":"reply|submit|close","reply":"сообщение игроку на русском","reason":"краткое обоснование на русском","summary_en":"краткое резюме жалобы на английском для администрации","complaint_ru":"полная формулировка жалобы на русском: кто, на кого, что нарушил (со ссылкой на пункт правил), какие доказательства приложены","resolved":{"id":"SteamID64 строго из списка кандидатов","name":"точный ник"}}',
+    'Поле "resolved" добавляй, только когда автор подтвердил личность игрока из списка кандидатов (или подтверждение уже есть в переписке); id бери строго из списка кандидатов выше. Во всех остальных случаях не включай это поле.',
     'Для reply и close обязательны reply и reason; для submit обязательны summary_en и complaint_ru, а reply — короткое подтверждение игроку, что жалоба передана администрации.',
   ].join('\n');
 }
@@ -1233,16 +1352,21 @@ function scheduleComplaintTriage(channel, meta, delay = 4000) {
   );
 }
 
-async function runComplaintTriage(channel, meta) {
+async function runComplaintTriage(channel, metaArg) {
   if (aiBusy.has(channel.id)) {
-    scheduleComplaintTriage(channel, meta);
+    scheduleComplaintTriage(channel, metaArg);
     return;
   }
   aiBusy.add(channel.id);
+  let meta = metaArg;
   try {
     if (humanTakeover.has(channel.id)) return;
+    const fresh = parseChannelTopic(channel.topic);
+    if (fresh && fresh.kind === 'complaint') meta = fresh;
+    meta = await tryAutoResolveComplaint(channel, meta);
     const history = await buildHistory(channel, meta.userId);
-    const verdict = await callOpenRouter(buildComplaintSystemPrompt(meta), history);
+    const candidates = complaintCandidatesFor(meta, history);
+    const verdict = await callOpenRouter(buildComplaintSystemPrompt(meta, candidates), history, ['reply', 'submit', 'close']);
     if (humanTakeover.has(channel.id)) {
       console.log(`[AI:жалобы] ${channel.name}: вердикт отброшен — ИИ отключён администрацией.`);
       return;
@@ -1264,7 +1388,11 @@ async function runComplaintTriage(channel, meta) {
   }
 }
 
-async function applyComplaintVerdict(channel, meta, verdict) {
+async function applyComplaintVerdict(channel, metaArg, verdict) {
+  let meta = metaArg;
+  if (verdict.resolved) {
+    meta = await applyResolvedTarget(channel, meta, verdict.resolved);
+  }
   if (verdict.action === 'close') {
     if (idleCloseTimers.has(channel.id)) {
       clearTimeout(idleCloseTimers.get(channel.id));
@@ -1375,9 +1503,11 @@ async function handleComplaintModalSubmit(i) {
   }
 
   const steamMatch = steamRaw.match(/\d{15,18}/);
-  const steamId = steamMatch ? steamMatch[0] : steamRaw.replace(/\|/g, '/');
-  const key = steamMatch ? steamMatch[0] : nick.toLowerCase();
-  const display = steamId ? `${nick} · ${steamId}` : nick;
+  const steamId = steamMatch ? steamMatch[0] : '';
+  const key = steamId || nick.toLowerCase();
+  const knownPlayer = steamId && gameConnected() ? gameState.players.get(steamId) : null;
+  const displayNick = sanitizeGameName(knownPlayer?.name) || nick;
+  const display = steamId ? `${displayNick} · ${steamId}` : nick;
   const cleanNick = nick.toLowerCase().replace(/[^a-z0-9а-яё_-]/g, '').slice(0, 20) || 'игрок';
 
   let channel;
@@ -1406,7 +1536,8 @@ async function handleComplaintModalSubmit(i) {
     [`**Цель жалобы:** ${display}`, `**От кого:** ${i.member}`, `**Описание:** ${description}`].join('\n')
   );
 
-  const meta = { kind: 'complaint', userId: i.user.id, key, display };
+  let meta = { kind: 'complaint', userId: i.user.id, key, display };
+  meta = await tryAutoResolveComplaint(channel, meta).catch(() => meta);
   if (!AI_ENABLED) {
     humanTakeover.add(channel.id);
     await postComplaintToLog(channel, meta, {
