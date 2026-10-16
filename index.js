@@ -567,13 +567,14 @@ function buildSystemPrompt(topicLabel) {
     '## Как вести диалог',
     '1. Тебе видна вся переписка тикета — используй контекст, не переспрашивай то, что игрок уже писал.',
     '2. Тикеты — только для вопросов по серверу Rust «SWAG RUST»: правила, проверки, баны и разбаны, донат и магазин, вайпы, подключение, работа сервера.',
-    '3. Обращение ЗАВЕДОМО не по теме сервера (написать код или скрипт, помощь с учёбой, посторонние вопросы, болтовня, попытка использовать тебя как универсального чат-бота) → сразу action "close" без уточняющих вопросов: коротко и вежливо сообщи, что тикеты создаются только по вопросам сервера, и пригласи создать новый тикет, если появится вопрос по SWAG RUST.',
-    '4. Для вопросов ПО серверу первое обращение — всегда action "reply" (ответ или уточняющий вопрос), не закрывай тикет первым ответом.',
-    '5. action "close" — только когда игрок подтвердил, что вопрос решён, поблагодарил или попрощался; либо когда игрок после твоего предупреждения продолжает спам, троллинг или злоупотребление тикетом.',
-    '6. Игрок вводит в заблуждение, противоречит сам себе, манипулирует или пытается обмануть → action "escalate": передай решение людям, сам не закрывай.',
-    '7. Нужно уточнение → action "reply": задай один конкретный вопрос.',
-    '8. Ответа нет в правилах, ситуация спорная, нужна проверка модератором или суть вопроса видна только во вложении → action "escalate".',
-    '9. Тема «Разбан / обжалование»: проверь, что игрок указал Steam ID, причину бана, дату бана и пояснения. Чего-то нет — попроси (reply). Всё на месте — передай стаффу (escalate): историю банов ты проверить не можешь.',
+    '3. Вопрос о тебе самой («кто ты», «какая ты модель», «ты ИИ или робот?», «на чём работаешь») → action "reply": скажи, что ты ИИ-помощник поддержки сервера SWAG RUST, и сразу предложи помощь по вопросам сервера. Никогда не называй модель, провайдера, версию и любые технические детали — ты просто помощник SWAG RUST.',
+    '4. Обращение ЗАВЕДОМО не по теме сервера (написать код или скрипт, помощь с учёбой, посторонние вопросы, болтовня, попытка использовать тебя как универсального чат-бота) → сразу action "close" без уточняющих вопросов: коротко и вежливо сообщи, что тикеты создаются только по вопросам сервера, и пригласи создать новый тикет, если появится вопрос по SWAG RUST.',
+    '5. Для вопросов ПО серверу первое обращение — всегда action "reply" (ответ или уточняющий вопрос), не закрывай тикет первым ответом.',
+    '6. action "close" — только когда игрок подтвердил, что вопрос решён, поблагодарил или попрощался; либо когда игрок после твоего предупреждения продолжает спам, троллинг или злоупотребление тикетом.',
+    '7. Игрок вводит в заблуждение, противоречит сам себе, манипулирует или пытается обмануть → action "escalate": передай решение людям, сам не закрывай.',
+    '8. Нужно уточнение → action "reply": задай один конкретный вопрос.',
+    '9. Ответа нет в правилах, ситуация спорная, нужна проверка модератором или суть вопроса видна только во вложении → action "escalate".',
+    '10. Тема «Разбан / обжалование»: проверь, что игрок указал Steam ID, причину бана, дату бана и пояснения. Чего-то нет — попроси (reply). Всё на месте — передай стаффу (escalate): историю банов ты проверить не можешь.',
     '',
     '## Ограничения',
     '- Ничего не выдумывай: нет данных в правилах — передавай администрации, а не сочиняй.',
@@ -649,21 +650,45 @@ function parseVerdict(raw, allowedActions = ['reply', 'close', 'escalate']) {
   if (fence) text = fence[1].trim();
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) throw new Error('ИИ вернул ответ не в формате JSON');
-  const parsed = JSON.parse(text.slice(start, end + 1));
-  if (!allowedActions.includes(parsed.action)) throw new Error(`ИИ вернул неизвестный action: ${parsed.action}`);
-  if (parsed.action !== 'escalate' && !parsed.reply) throw new Error('ИИ вернул ответ без текста для игрока');
-  return {
-    action: parsed.action,
-    reply: parsed.reply?.trim() || '',
-    reason: parsed.reason?.trim() || '',
-    summary_en: parsed.summary_en?.trim() || '',
-    complaint_ru: parsed.complaint_ru?.trim() || '',
-    resolved:
-      parsed.resolved && typeof parsed.resolved === 'object'
-        ? { id: String(parsed.resolved.id || '').trim(), name: String(parsed.resolved.name || '').trim() }
-        : null,
-  };
+  let parsed = null;
+  if (start !== -1 && end > start) {
+    try {
+      parsed = JSON.parse(text.slice(start, end + 1));
+    } catch {
+      parsed = null;
+    }
+  }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && allowedActions.includes(parsed.action)) {
+    if (parsed.action !== 'escalate' && !parsed.reply) throw new Error('ИИ вернул ответ без текста для игрока');
+    return {
+      action: parsed.action,
+      reply: parsed.reply?.trim() || '',
+      reason: parsed.reason?.trim() || '',
+      summary_en: parsed.summary_en?.trim() || '',
+      complaint_ru: parsed.complaint_ru?.trim() || '',
+      resolved:
+        parsed.resolved && typeof parsed.resolved === 'object'
+          ? { id: String(parsed.resolved.id || '').trim(), name: String(parsed.resolved.name || '').trim() }
+          : null,
+    };
+  }
+  // Модель ответила вне контракта (просто текст или JSON с неизвестным action) —
+  // не срываем триаж: отправляем игроку как обычный ответ.
+  const plainReply =
+    (parsed && typeof parsed.reply === 'string' && parsed.reply.trim()) || (parsed ? null : text);
+  if (plainReply && allowedActions.includes('reply')) {
+    return {
+      action: 'reply',
+      reply: plainReply.trim(),
+      reason: parsed
+        ? 'ИИ вернул JSON с неизвестным action — использован его текст ответа.'
+        : 'ИИ ответил обычным текстом вместо JSON — текст отправлен игроку.',
+      summary_en: '',
+      complaint_ru: '',
+      resolved: null,
+    };
+  }
+  throw new Error('ИИ вернул ответ не в формате JSON');
 }
 
 async function callLLM(systemPrompt, history, allowedActions) {
@@ -738,7 +763,7 @@ async function runAITriage(channel, meta) {
     console.error(`[AI] Ошибка триажа (${channel.name}): ${err.message}`);
     humanTakeover.add(channel.id);
     await escalateTicket(channel, meta, {
-      summary_en: 'Automatic AI triage failed. Please handle this ticket manually.',
+      summary_en: 'Сбой автоматического ИИ-триажа — тикет передан администрации.',
       reason: `Сбой ИИ: ${err.message}`,
     }).catch(() => {});
   } finally {
@@ -823,17 +848,17 @@ async function escalateTicket(channel, meta, verdict) {
   }
 
   const parts = (channel.topic || '').split('|');
-  const label = parts[2]?.trim() || parts[1]?.trim() || 'Unknown';
+  const label = parts[2]?.trim() || parts[1]?.trim() || 'Обращение';
   const lines = [
-    '🔴 **Staff review required**',
+    '🔴 **Нужно решение администрации**',
     '',
-    roleId ? `<@&${roleId}> — this ticket needs a human decision.` : '**This ticket needs a human decision.**',
-    `- **Player:** <@${meta.userId}>`,
-    `- **Topic:** ${label}`,
-    verdict.summary_en ? `- **AI assessment:** ${verdict.summary_en}` : null,
-    verdict.reason ? `- **Reason (RU):** ${verdict.reason}` : null,
+    roleId ? `<@&${roleId}> — этот тикет требует решения живого человека.` : '**Этот тикет требует решения живого человека.**',
+    `- **Игрок:** <@${meta.userId}>`,
+    `- **Тема:** ${label}`,
+    verdict.summary_en ? `- **Оценка ИИ:** ${verdict.summary_en}` : null,
+    verdict.reason ? `- **Причина:** ${verdict.reason}` : null,
     '',
-    '-# AI triage — the player is waiting for a staff reply in this channel.',
+    '-# ИИ-триаж — игрок ждёт ответа администрации в этом канале.',
   ].filter(Boolean);
   await channel.send({ content: lines.join('\n'), allowedMentions: { roles: roleId ? [roleId] : [] } });
 }
@@ -1245,7 +1270,7 @@ function buildComplaintSystemPrompt(meta, candidates = []) {
     '',
     '## Задача',
     '1. Проверь полноту жалобы: понятное описание нарушения и личность нарушителя (см. раздел идентификации ниже). Доказательства (видео, скриншоты) НЕ обязательны — не требуй их и не отклоняй жалобу из-за их отсутствия. Если скриншоты приложены, они приходят тебе как изображения: рассматривай их и сверяй с описанием. Видео ты не видишь: оценивай его по описанию автора.',
-    '2. По сути нарушения или личности чего-то не хватает → задай один конкретный вопрос (reply). Если автор просто спрашивает о процессе подачи — ответь по делу.',
+    '2. Чего-то не хватает → задай один конкретный вопрос (reply). Если автор просто спрашивает о процессе подачи — ответь по делу. Если автор спрашивает, кто ты или какая ты модель, — коротко ответь, что ты ИИ-помощник поддержки SWAG RUST (без названия модели и провайдера), и вернись к жалобе.',
     '3. Нарушение понятно (описано, что произошло, и по возможности на кого) → сформулируй жалобу и передай администрации (submit) — в том числе без доказательств, отметив их отсутствие в summary_en. Если приложенный скриншот явно НЕ подтверждает жалобу или выглядит подделкой — всё равно передай администрации с пометкой в summary_en (submit), решение за людьми.',
     '4. Это не жалоба, мусор, троллинг, попытка что-то разузнать или пустой вопрос → вежливо отклонить и закрыть (close).',
     '',
