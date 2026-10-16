@@ -12,8 +12,9 @@ Discord-бот: автоматически выдаёт роль «игрок» 
 | `SUPPORT_ROLE_ID` | нет | ID роли администрации — она увидит все тикеты. Если не задать, тикеты видят только участники с правом «Администратор» |
 | `TICKET_CATEGORY_ID` | нет | ID категории, в которой создавать тикеты |
 | `ENABLE_MESSAGE_CONTENT` | нет | `true` = бот читает текст всех сообщений (нужен включённый Message Content Intent в Developer Portal). **Обязательно для ИИ-триажа** |
-| `OPENROUTER_API_KEY` | нет | Ключ с [openrouter.ai/keys](https://openrouter.ai/keys) — включает ИИ-триаж тикетов |
-| `OPENROUTER_MODEL` | нет | Модель OpenRouter (по умолчанию `anthropic/claude-haiku-5.5`) |
+| `AI_BASE_URL` | нет | База любого OpenAI-совместимого API (по умолчанию `https://openrouter.ai/api/v1`; например river.ai — `https://api.river.ai/v1`). Указывается без `/chat/completions` |
+| `AI_API_KEY` | нет | Ключ к API ИИ — включает ИИ-триаж тикетов (запасное старое имя — `OPENROUTER_API_KEY`) |
+| `AI_MODEL` | нет | Название модели у провайдера (по умолчанию `anthropic/claude-haiku-5.5`; запасное старое имя — `OPENROUTER_MODEL`) |
 | `STAFF_ROLE_ID` | нет | ID роли администрации — пингуется при эскалации тикета ИИ |
 | `SERVER_NAME` | нет | Название сервера для системного промпта ИИ (по умолчанию `SWAG RUST`) |
 | `SERVER_CONNECT` | нет | Адрес connect для промпта ИИ (по умолчанию `157.85.87.131:28061`) |

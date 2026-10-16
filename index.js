@@ -66,8 +66,9 @@ const SUPPORT_ROLE_ID = process.env.SUPPORT_ROLE_ID?.trim() || null;
 const TICKET_CATEGORY_ID = process.env.TICKET_CATEGORY_ID?.trim() || null;
 const BRAND_COLOR = parseInt((process.env.BRAND_COLOR || 'D99A8C').replace('#', ''), 16);
 const MESSAGE_CONTENT = process.env.ENABLE_MESSAGE_CONTENT === 'true';
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY?.trim() || null;
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL?.trim() || 'anthropic/claude-haiku-5.5';
+const AI_BASE_URL = process.env.AI_BASE_URL?.trim().replace(/\/+$/, '') || 'https://openrouter.ai/api/v1';
+const AI_API_KEY = process.env.AI_API_KEY?.trim() || process.env.OPENROUTER_API_KEY?.trim() || null;
+const AI_MODEL = process.env.AI_MODEL?.trim() || process.env.OPENROUTER_MODEL?.trim() || 'anthropic/claude-haiku-5.5';
 const STAFF_ROLE_ID = process.env.STAFF_ROLE_ID?.trim() || process.env.SUPPORT_ROLE_ID?.trim() || null;
 const SERVER_NAME = process.env.SERVER_NAME?.trim() || 'SWAG RUST';
 const SERVER_CONNECT = process.env.SERVER_CONNECT?.trim() || '157.85.87.131:28061';
@@ -76,7 +77,7 @@ const AI_RULES = (process.env.AI_RULES?.trim() || DEFAULT_RULES).replace(/\\n/g,
 const AI_IDLE_CLOSE_MINUTES = parseInt(process.env.AI_IDLE_CLOSE_MINUTES || '5', 10);
 const COMPLAINTS_LOG_CHANNEL_ID = process.env.COMPLAINTS_LOG_CHANNEL_ID?.trim() || null;
 const GAME_API_SECRET = process.env.GAME_API_SECRET?.trim() || null;
-const AI_ENABLED = Boolean(OPENROUTER_API_KEY);
+const AI_ENABLED = Boolean(AI_API_KEY);
 
 if (!TOKEN) {
   console.error('Ошибка: не задан TOKEN. Добавьте переменную TOKEN на Railway (вкладка Variables) или в файл .env.');
@@ -94,7 +95,7 @@ if (!ROLE_ID) {
 }
 if (AI_ENABLED && !MESSAGE_CONTENT) {
   console.error(
-    'ВНИМАНИЕ: задан OPENROUTER_API_KEY, но ENABLE_MESSAGE_CONTENT != true — ИИ не сможет читать сообщения. Включите Message Content Intent в Discord Developer Portal и поставьте ENABLE_MESSAGE_CONTENT=true.'
+    'ВНИМАНИЕ: задан ключ ИИ, но ENABLE_MESSAGE_CONTENT != true — ИИ не сможет читать сообщения. Включите Message Content Intent в Discord Developer Portal и поставьте ENABLE_MESSAGE_CONTENT=true.'
   );
 }
 
@@ -665,20 +666,19 @@ function parseVerdict(raw, allowedActions = ['reply', 'close', 'escalate']) {
   };
 }
 
-async function callOpenRouter(systemPrompt, history, allowedActions) {
+async function callLLM(systemPrompt, history, allowedActions) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 45_000);
   try {
-    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    const res = await fetch(`${AI_BASE_URL}/chat/completions`, {
       method: 'POST',
       signal: controller.signal,
       headers: {
-        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        Authorization: `Bearer ${AI_API_KEY}`,
         'Content-Type': 'application/json',
-        'X-Title': 'SwagHelpBot',
       },
       body: JSON.stringify({
-        model: OPENROUTER_MODEL,
+        model: AI_MODEL,
         temperature: 0.2,
         max_tokens: 1000,
         messages: [{ role: 'system', content: systemPrompt }, ...history],
@@ -686,7 +686,7 @@ async function callOpenRouter(systemPrompt, history, allowedActions) {
     });
     if (!res.ok) {
       const body = await res.text().catch(() => '');
-      throw new Error(`OpenRouter ${res.status}: ${body.slice(0, 300)}`);
+      throw new Error(`ИИ API ${res.status}: ${body.slice(0, 300)}`);
     }
     const data = await res.json();
     const raw = data.choices?.[0]?.message?.content;
@@ -727,7 +727,7 @@ async function runAITriage(channel, meta) {
     const parts = (channel.topic || '').split('|');
     const topicLabel = parts[2]?.trim() || parts[1]?.trim() || 'Обращение';
     const history = await buildHistory(channel, meta.userId);
-    const verdict = await callOpenRouter(buildSystemPrompt(topicLabel), history);
+    const verdict = await callLLM(buildSystemPrompt(topicLabel), history);
     if (humanTakeover.has(channel.id)) {
       console.log(`[AI] ${channel.name}: вердикт отброшен — ИИ отключён командой администрации.`);
       return;
@@ -892,14 +892,14 @@ async function checkTicketSetup(guild) {
 client.once(Events.ClientReady, async (c) => {
   console.log(`Бот запущен как ${c.user.tag}`);
   if (AI_ENABLED) {
-    console.log(`ИИ-триаж тикетов включён: OpenRouter, модель ${OPENROUTER_MODEL}.`);
+    console.log(`ИИ-триаж тикетов включён: модель ${AI_MODEL} через ${AI_BASE_URL}.`);
     console.log(
       STAFF_ROLE_ID
         ? `Пинг администрации при эскалации: роль ${STAFF_ROLE_ID}.`
         : 'STAFF_ROLE_ID не задан — эскалация уйдёт без пинга роли.'
     );
   } else {
-    console.log('ИИ-триаж выключен (OPENROUTER_API_KEY не задан) — тикеты обрабатывает только администрация.');
+    console.log('ИИ-триаж выключен (ключ ИИ не задан) — тикеты обрабатывает только администрация.');
   }
   if (!MESSAGE_CONTENT) {
     console.log('Чтение текста сообщений выключено (ENABLE_MESSAGE_CONTENT=false) — бот видит текст только при теге/ответе.');
@@ -1366,7 +1366,7 @@ async function runComplaintTriage(channel, metaArg) {
     meta = await tryAutoResolveComplaint(channel, meta);
     const history = await buildHistory(channel, meta.userId);
     const candidates = complaintCandidatesFor(meta, history);
-    const verdict = await callOpenRouter(buildComplaintSystemPrompt(meta, candidates), history, ['reply', 'submit', 'close']);
+    const verdict = await callLLM(buildComplaintSystemPrompt(meta, candidates), history, ['reply', 'submit', 'close']);
     if (humanTakeover.has(channel.id)) {
       console.log(`[AI:жалобы] ${channel.name}: вердикт отброшен — ИИ отключён администрацией.`);
       return;
